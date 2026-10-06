@@ -17,7 +17,7 @@ torch.set_num_threads(4)
 
 def load_membership(path: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
     m = pd.read_csv(path, parse_dates=["valid_from", "valid_to"])
-    m = m[m["index_name"].str.lower().eq("nifty 100")]
+    m = m[m["index_name"].str.lower().eq("nifty 100")].copy()
     return m[(m["valid_to"].isna() | (m["valid_to"] >= start)) & (m["valid_from"] <= end)].copy()
 
 
@@ -34,13 +34,15 @@ def rolling_pca_residuals(
     pca_window: int = 252,
     beta_window: int = 60,
 ) -> pd.DataFrame:
-    """Paper-style PCA residuals, computed strictly out of sample.
+    """Leakage-safe PCA factor residuals following the paper's rolling design.
 
-    At t-1 the PCA factors are estimated from the previous 252 days of the
-    correlation matrix. Factor loadings are then estimated from the previous
-    60 days, and the residual for t is computed using only information through
-    t-1. This follows the paper's PCA procedure rather than fitting PCA on the
-    same 1000-day window used to train the neural network.
+    PCA is estimated from the previous 252 trading days of standardized returns.
+    Factor loadings are estimated from the previous 60 trading days.  Both are
+    therefore known before the residual at date t is formed.
+
+    Missing observations are handled asset-by-asset rather than requiring every
+    constituent to have an identical complete history.  This is important for a
+    point-in-time index whose membership changes through time.
     """
     out = pd.DataFrame(index=dates, columns=returns.columns, dtype=float)
     for ti in range(pca_window + beta_window, len(dates)):
@@ -48,9 +50,12 @@ def rolling_pca_residuals(
         assets = universe(membership, d, set(returns.columns))
         if len(assets) <= k:
             continue
+
+        # PCA estimation window. Keep assets with sufficiently complete histories,
+        # then use complete rows for the correlation/PCA calculation.
         hist = returns.iloc[ti - pca_window:ti][assets]
-        good = hist.notna().mean() >= 0.98
-        assets = list(good[good].index)
+        completeness = hist.notna().mean()
+        assets = list(completeness[completeness >= 0.98].index)
         if len(assets) <= k:
             continue
         hist = hist[assets]
@@ -58,37 +63,53 @@ def rolling_pca_residuals(
         sd = hist.std(ddof=0).replace(0, np.nan)
         valid = sd.notna()
         assets = list(valid[valid].index)
-        hist = hist[assets]
-        mu, sd = mu[assets], sd[assets]
         if len(assets) <= k:
             continue
+        hist = hist[assets]
+        mu, sd = mu[assets], sd[assets]
         z = (hist - mu) / sd
-        if z.isna().any().any():
+        z = z.dropna(axis=0, how="any")
+        if len(z) < max(60, k + 5):
             continue
+
         pca = PCA(n_components=k, random_state=SEED)
         pca.fit(z.values)
         eig = pca.components_.T
 
+        # Estimate each asset's factor loading from the preceding 60 days.
         beta_dates = dates[ti - beta_window:ti]
         beta_r = returns.loc[beta_dates, assets]
-        if beta_r.isna().any().any():
-            continue
         beta_z = (beta_r - mu) / sd
-        factors = beta_z.values @ eig
-        y = beta_r.values
-        X = np.column_stack([np.ones(len(beta_dates)), factors])
-        coef = np.linalg.lstsq(X, y, rcond=None)[0]
+        complete_factor_rows = beta_z.dropna(axis=0, how="any")
+        if len(complete_factor_rows) < max(30, k + 5):
+            continue
+        factors = complete_factor_rows.values @ eig
 
-        current = returns.loc[d, assets].fillna(0.0)
-        current_z = (current - mu) / sd
-        fcur = current_z.values @ eig
-        fitted = coef[0] + fcur @ coef[1:]
-        out.loc[d, assets] = current.values - fitted
+        coefs: dict[str, np.ndarray] = {}
+        for j, asset in enumerate(assets):
+            y = beta_r.loc[complete_factor_rows.index, asset].values
+            if not np.isfinite(y).all():
+                continue
+            X = np.column_stack([np.ones(len(factors)), factors])
+            coefs[asset] = np.linalg.lstsq(X, y, rcond=None)[0]
+        if len(coefs) <= k:
+            continue
+
+        # Form today's residual using only today's return and yesterday's model.
+        current = returns.loc[d, list(coefs.keys())]
+        current_z = (current - mu[list(coefs.keys())]) / sd[list(coefs.keys())]
+        for asset in coefs:
+            value = current.get(asset, np.nan)
+            if not np.isfinite(value):
+                continue
+            fcur = current_z[asset] * eig[assets.index(asset)]
+            fitted = coefs[asset][0] + float(np.dot(fcur, coefs[asset][1:]))
+            out.loc[d, asset] = float(value - fitted)
     return out
 
 
 class CNNTransformer(nn.Module):
-    """Small CNN + one-layer Transformer matching the paper's benchmark settings."""
+    """Small CNN + one-layer Transformer matching the paper benchmark settings."""
     def __init__(self, filters: int = 8, heads: int = 4, dropout: float = 0.25):
         super().__init__()
         self.conv1 = nn.Conv1d(1, filters, kernel_size=2, padding="same")
@@ -150,7 +171,6 @@ def train_model(residuals: pd.DataFrame, returns: pd.DataFrame, epochs: int = 10
     net = CNNTransformer()
     opt = torch.optim.Adam(net.parameters(), lr=1e-3)
     net.train()
-    # The paper trains in consecutive, non-overlapping 125-day temporal batches.
     for _ in range(epochs):
         for start in range(0, len(xs), 125):
             xb, yb = xs[start:start + 125], ys[start:start + 125]
@@ -205,14 +225,15 @@ def main():
             continue
         rr = residuals.reindex(index=train_dates, columns=assets)
         yy = r.reindex(index=train_dates, columns=assets)
-        keep = rr.notna().mean() >= 0.95
-        assets = list(keep[keep].index)
-        rr, yy = rr[assets], yy[assets]
-        rr = rr.dropna(axis=1, how="any")
-        assets = list(rr.columns)
-        yy = yy[assets]
-        if len(assets) < 50:
+
+        # Require a usable 30-day signal history, not 100% availability over the
+        # entire 1000-day training period. Membership changes naturally create NaNs.
+        usable = rr.notna().rolling(30, min_periods=30).sum().max()
+        keep = usable[usable >= 30].index
+        rr, yy = rr[keep], yy[keep]
+        if len(keep) < 50:
             continue
+        # Training samples require complete 30-day windows; train_model filters them.
         net = train_model(rr, yy, epochs=args.epochs)
         if net is None:
             continue
@@ -222,13 +243,14 @@ def main():
         for d in block:
             prior = dates[dates <= d]
             wdates = prior[-30:]
-            sig = residuals.reindex(index=wdates, columns=assets)
-            if len(wdates) < 30 or sig.isna().any().any():
+            sig = residuals.reindex(index=wdates, columns=keep)
+            valid_assets = sig.columns[sig.notna().all()].tolist()
+            if len(wdates) < 30 or len(valid_assets) < 50:
                 continue
-            x = torch.tensor(np.cumsum(sig.values.T, axis=1)[None], dtype=torch.float32)
+            x = torch.tensor(np.cumsum(sig[valid_assets].values.T, axis=1)[None], dtype=torch.float32)
             with torch.no_grad():
                 w = net(x).numpy()[0]
-            realized = r.loc[d, assets].fillna(0.0).values
+            realized = r.loc[d, valid_assets].fillna(0.0).values
             pr = float(np.dot(w, realized))
             all_port.append((d, pr))
             block_ret.append(pr)
@@ -237,13 +259,13 @@ def main():
             blocks.append({
                 "start": str(block[0].date()),
                 "end": str(block[-1].date()),
-                "assets": len(assets),
+                "assets": len(keep),
                 "n_days": len(a),
                 "sharpe": float(np.sqrt(252) * a.mean() / (a.std(ddof=1) + 1e-12)),
             })
 
     port = pd.DataFrame(all_port, columns=["date", "return"]).drop_duplicates("date").sort_values("date")
-    if len(port):
+    if len(port) >= 2:
         vol = float(port["return"].std(ddof=1) * np.sqrt(252))
         mu = float(port["return"].mean() * 252)
         wealth = np.exp(port["return"].cumsum())
@@ -257,9 +279,11 @@ def main():
             "sharpe": float(mu / vol) if vol else None,
             "max_drawdown": float(dd.min()),
             "total_compounded_return": float(np.exp(port["return"].sum()) - 1),
+            "n_blocks": len(blocks),
         }
     else:
-        metrics = {"error": "No out-of-sample observations were produced."}
+        raise RuntimeError("No out-of-sample observations were produced; refusing to report fabricated or empty performance metrics.")
+
     (out / "metrics.json").write_text(json.dumps(metrics, indent=2))
     (out / "blocks.json").write_text(json.dumps(blocks, indent=2))
     port.to_csv(out / "portfolio_returns.csv", index=False)
