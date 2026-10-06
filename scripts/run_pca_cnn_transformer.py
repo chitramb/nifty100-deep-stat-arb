@@ -35,7 +35,7 @@ torch.set_num_threads(4)
 @dataclass
 class PCAState:
     assets: list[str]
-    phi: np.ndarray  # residual-return map: epsilon = phi @ R
+    phi: np.ndarray
 
 
 def load_membership(path: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
@@ -58,16 +58,12 @@ def fit_pca_state(
     pca_window: int = PCA_WINDOW,
     beta_window: int = BETA_WINDOW,
 ) -> tuple[pd.Timestamp, PCAState, pd.Series] | None:
-    """Estimate Phi_{t-1} and the residual epsilon_t out of sample.
+    """Estimate Phi_{t-1} and epsilon_t strictly out of sample.
 
-    This follows the paper's PCA implementation: estimate the correlation/PCA
-    factors from the previous 252 trading days, estimate stock factor loadings
-    from the previous 60 days, and form today's residual using only information
-    available through t-1.
-
-    PCA factors are factor-mimicking portfolios.  If Z_t is the vector of
-    standardized returns and V contains the PCA eigenvectors, F_t = V' Z_t.
-    Therefore w_F = diag(1/sigma) V and Phi = I - beta w_F'.
+    The paper estimates PCA factors from the previous 252 trading days, then
+    estimates each stock's loading on those factors over the previous 60 days,
+    and only then computes the residual for day t.  Missing observations in the
+    rolling estimation window exclude that stock for that day's factor model.
     """
     if ti < pca_window + beta_window:
         return None
@@ -76,11 +72,12 @@ def fit_pca_state(
     if len(candidate) <= k:
         return None
 
-    # The paper drops stocks with missing observations in the rolling window.
-    # We use the union of the PCA and loading windows, plus today's return.
     hist_all = returns.iloc[ti - pca_window:ti][candidate]
     beta_all = returns.iloc[ti - beta_window:ti][candidate]
     current = returns.iloc[ti][candidate]
+
+    # This is a trading-date eligibility check, not a model input: a stock with
+    # no realized return on t simply cannot contribute to the residual on t.
     complete = hist_all.notna().all(axis=0) & beta_all.notna().all(axis=0) & current.notna()
     assets = list(complete[complete].index)
     if len(assets) <= k:
@@ -99,10 +96,10 @@ def fit_pca_state(
     if not np.isfinite(z).all():
         return None
 
-    # PCA on the correlation matrix = PCA on standardized returns.
+    # PCA on standardized returns is PCA on the rolling correlation matrix.
     pca = PCA(n_components=k, random_state=SEED)
     pca.fit(z)
-    V = pca.components_.T  # N x K; columns are eigenvectors
+    V = pca.components_.T  # N x K eigenvectors
 
     beta_r = beta_all[assets]
     beta_z = (beta_r - mu) / sd
@@ -110,12 +107,12 @@ def fit_pca_state(
         return None
     factor_returns = beta_z.values @ V  # 60 x K
 
-    X = np.column_stack([np.ones(len(factor_returns)), factor_returns])
-    beta = np.linalg.lstsq(X, beta_r.values, rcond=None)[0][1:, :].T  # N x K
+    # Equation R_t = beta' F_t + epsilon_t: no look-ahead and no separate
+    # intercept is introduced, matching the paper's factor-model formulation.
+    beta = np.linalg.lstsq(factor_returns, beta_r.values, rcond=None)[0].T  # N x K
 
-    # Factor mimicking-portfolio weights: F = w_F' R, ignoring the absorbed
-    # intercept because factor returns are demeaned/standardized over the PCA window.
-    w_f = V / sd.to_numpy()[:, None]  # N x K
+    # F_t = w_F' R_t for w_F = diag(1/sigma) V.
+    w_f = V / sd.to_numpy()[:, None]
     phi = np.eye(len(assets)) - beta @ w_f.T
 
     cur = current[assets]
@@ -148,9 +145,9 @@ class CNNTransformer(nn.Module):
         super().__init__()
         self.filters = filters
         self.conv1 = nn.Conv1d(1, filters, kernel_size=2, padding=0, bias=True)
-        self.norm1 = nn.InstanceNorm1d(filters, affine=False)
+        self.norm1 = nn.InstanceNorm1d(filters, affine=True)
         self.conv2 = nn.Conv1d(filters, filters, kernel_size=2, padding=0, bias=True)
-        self.norm2 = nn.InstanceNorm1d(filters, affine=False)
+        self.norm2 = nn.InstanceNorm1d(filters, affine=True)
         layer = nn.TransformerEncoderLayer(
             d_model=filters,
             nhead=heads,
@@ -170,8 +167,6 @@ class CNNTransformer(nn.Module):
         )
 
     def _causal_conv(self, conv: nn.Conv1d, x: torch.Tensor) -> torch.Tensor:
-        # Equation A.1/A.2 uses x_{l-m+1}; pad only on the left so no future
-        # point within the 30-day window enters a local feature.
         x = F.pad(x, (conv.kernel_size[0] - 1, 0))
         return conv(x)
 
@@ -185,7 +180,7 @@ class CNNTransformer(nn.Module):
         z = self._causal_conv(self.conv2, z)
         z = torch.relu(self.norm2(z))
         z = z + x0.expand(-1, self.filters, -1)
-        z = z.transpose(1, 2)  # batch*assets x L x D
+        z = z.transpose(1, 2)
         z = self.transformer(z)
         signal = z[:, -1, :]
         raw = self.alloc(signal).squeeze(-1)
@@ -197,7 +192,6 @@ def stock_weights_from_residual_weights(
     phi: torch.Tensor,
     mask: torch.Tensor,
 ) -> torch.Tensor:
-    """Map residual weights to stock weights and impose ||w_R||_1 = 1."""
     rw = residual_weights * mask
     stock = torch.bmm(rw.unsqueeze(1), phi).squeeze(1)
     denom = stock.abs().sum(dim=1, keepdim=True).clamp_min(1e-8)
@@ -210,7 +204,6 @@ def make_training_batch(
     returns: pd.DataFrame,
     states: dict[pd.Timestamp, PCAState],
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[str]] | None:
-    """Build one 125-day temporal batch with a union asset universe and masks."""
     if not target_dates:
         return None
     union: set[str] = set()
@@ -221,24 +214,20 @@ def make_training_batch(
     if len(assets) < 50:
         return None
 
-    n, l = len(target_dates), LOOKBACK
-    a = len(assets)
+    n, l, a = len(target_dates), LOOKBACK, len(assets)
     x = np.zeros((n, a, l), dtype=np.float32)
     y = np.zeros((n, a), dtype=np.float32)
     mask = np.zeros((n, a), dtype=np.float32)
     phi = np.zeros((n, a, a), dtype=np.float32)
+    pos = {s: j for j, s in enumerate(assets)}
 
     for bi, d in enumerate(target_dates):
         state = states.get(d)
         if state is None:
             continue
-        pos = {s: j for j, s in enumerate(assets)}
         active = [s for s in state.assets if s in pos]
-        if not active:
-            continue
-        idx = [pos[s] for s in active]
         prior = residuals.index[residuals.index < d]
-        if len(prior) < LOOKBACK:
+        if len(active) == 0 or len(prior) < LOOKBACK:
             continue
         wdates = prior[-LOOKBACK:]
         sig = residuals.loc[wdates, active]
@@ -248,25 +237,16 @@ def make_training_batch(
         if len(valid_assets) < 50:
             continue
         vidx = [pos[s] for s in valid_assets]
-        vals = sig[valid_assets].to_numpy().T
-        x[bi, vidx, :] = np.cumsum(vals, axis=1).astype(np.float32)
+        x[bi, vidx, :] = np.cumsum(sig[valid_assets].to_numpy().T, axis=1).astype(np.float32)
         y[bi, vidx] = target[valid_assets].to_numpy(dtype=np.float32)
         mask[bi, vidx] = 1.0
-
-        # Extract the matching submatrix of Phi.
         state_pos = {s: j for j, s in enumerate(state.assets)}
         si = [state_pos[s] for s in valid_assets]
         phi[bi][np.ix_(vidx, vidx)] = state.phi[np.ix_(si, si)].astype(np.float32)
 
     if mask.sum() < n * 50:
         return None
-    return (
-        torch.from_numpy(x),
-        torch.from_numpy(y),
-        torch.from_numpy(mask),
-        torch.from_numpy(phi),
-        assets,
-    )
+    return torch.from_numpy(x), torch.from_numpy(y), torch.from_numpy(mask), torch.from_numpy(phi), assets
 
 
 def sharpe_loss(portfolio_returns: torch.Tensor) -> torch.Tensor:
@@ -280,11 +260,9 @@ def train_model(
     train_dates: pd.DatetimeIndex,
     epochs: int = 100,
 ) -> CNNTransformer | None:
-    """Jointly optimize signal and allocation on consecutive 125-day batches."""
     usable_dates = [d for d in train_dates if d in states]
     if len(usable_dates) < 300:
         return None
-
     batches = []
     for start in range(0, len(usable_dates), BATCH_DAYS):
         batch = make_training_batch(usable_dates[start:start + BATCH_DAYS], residuals, returns, states)
@@ -315,7 +293,6 @@ def evaluate_day(
     returns: pd.DataFrame,
     state: PCAState,
 ) -> tuple[float, np.ndarray, list[str]] | None:
-    """Generate t-1 information and evaluate the realized return at t."""
     prior = residuals.index[residuals.index < d]
     if len(prior) < LOOKBACK:
         return None
@@ -328,10 +305,9 @@ def evaluate_day(
     if len(valid_assets) < 50:
         return None
 
-    x_np = np.cumsum(sig[valid_assets].to_numpy().T, axis=1)[None].astype(np.float32)
-    x = torch.from_numpy(x_np)
+    x = torch.from_numpy(np.cumsum(sig[valid_assets].to_numpy().T, axis=1)[None].astype(np.float32))
     raw = net(x)[0]
-    mask = torch.ones_like(raw).unsqueeze(0)
+    mask = torch.ones((1, len(valid_assets)), dtype=torch.float32)
     state_pos = {s: i for i, s in enumerate(active)}
     si = [state_pos[s] for s in valid_assets]
     phi_sub = torch.from_numpy(state.phi[np.ix_(si, si)].astype(np.float32))[None]
@@ -358,8 +334,8 @@ def main() -> None:
     e["date"] = pd.to_datetime(e["date"])
     e = e[(e.date >= args.start) & (e.date <= args.end)]
     p = e.pivot_table(index="date", columns="symbol", values="close_adjusted", aggfunc="last").sort_index()
-    # The paper uses daily adjusted returns. For portfolio evaluation we therefore
-    # use simple returns; cumulative residuals are sums of residual returns.
+    # The paper evaluates daily adjusted returns and uses cumulative residual returns
+    # as the 30-day CNN input.
     r = p.pct_change(fill_method=None)
     m = load_membership(args.membership, p.index.min(), p.index.max())
     dates = p.index
