@@ -1,0 +1,51 @@
+universe:
+  name: NIFTY100
+  start: "2014-01-01"
+  end: "2026-09-23"
+
+data:
+  price_field: close_adjusted
+  return_type: log
+  corporate_action_adjustment: true
+  dividends_adjusted: false
+
+factor_model:
+  type: PCA
+  n_factors: 5
+  pca_window_days: 252
+  loading_window_days: 60
+  residuals_out_of_sample: true
+
+signal:
+  lookback_days: 30
+  representation: cumulative_residual
+
+model:
+  cnn:
+    layers: 2
+    filters: 8
+    kernel_size: 2
+    instance_normalization: true
+    residual_connection: true
+  transformer:
+    layers: 1
+    heads: 4
+    hidden_units: 16
+    dropout: 0.25
+
+portfolio:
+  normalization: l1
+  dollar_neutral: true
+  max_gross_leverage: 1.0
+
+training:
+  objective: sharpe
+  epochs: 100
+  learning_rate: 0.001
+  batch_days: 125
+
+backtest:
+  network_training_window_days: 1000
+  network_reestimation_days: 125
+  rebalance: daily
+  oos_start: "2019-01-02"
