@@ -45,8 +45,12 @@ def test_training_batch_uses_only_pre_target_residuals():
     assert y.shape == (10, 50)
     assert mask.shape == (10, 50)
     assert phi.shape == (10, 50, 50)
-    assert out_assets == assets
+
+    # make_training_batch deliberately uses a deterministic sorted union of
+    # assets.  Test the leakage property against that returned ordering rather
+    # than assuming the caller's original ordering.
+    assert out_assets == sorted(assets)
 
     # First target date is dates[30], so its 30-day signal must end at dates[29].
-    expected = residuals.loc[dates[:30], assets].to_numpy().T.cumsum(axis=1)
+    expected = residuals.loc[dates[:30], out_assets].to_numpy().T.cumsum(axis=1)
     assert np.allclose(x[0].numpy(), expected, atol=1e-6)
