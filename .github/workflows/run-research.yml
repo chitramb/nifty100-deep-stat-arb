@@ -13,16 +13,22 @@ on:
 
 concurrency:
   group: nifty100-research
-  cancel-in-progress: true
+  cancel-in-progress: false
+
+env:
+  PYTHONUNBUFFERED: '1'
+  PYTHONPATH: ${{ github.workspace }}
 
 jobs:
   backtest:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
@@ -34,8 +40,6 @@ jobs:
           pip install torch --index-url https://download.pytorch.org/whl/cpu
 
       - name: Run unit and leakage tests
-        env:
-          PYTHONPATH: ${{ github.workspace }}
         run: |
           python -m compileall -q scripts
           pytest -q tests/test_strategy_math.py tests/test_data.py
@@ -66,13 +70,22 @@ jobs:
           path: /tmp/nse-db/data
           key: nse-eod-a13d8112c71528183fff44ac8b27a1458bea3da4
 
+      - name: Restore prepared NIFTY-100 dataset
+        id: dataset-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: data/processed/nifty100_adjusted_prices.parquet
+          key: nifty100-adjusted-v1-2014-01-01-2026-09-23
+
       - name: Fetch NSEDATA4ME loader code
+        if: steps.dataset-cache.outputs.cache-hit != 'true'
         run: |
           git clone --depth 1 --single-branch https://github.com/ancap97/NSEDATA4ME.git /tmp/nse-code
           rm -rf /tmp/nse-code/data
           ln -s /tmp/nse-db/data /tmp/nse-code/data
 
       - name: Build adjusted NIFTY-100 dataset
+        if: steps.dataset-cache.outputs.cache-hit != 'true'
         run: |
           python scripts/prepare_nifty100_dataset.py \
             --nse-code /tmp/nse-code \
@@ -81,8 +94,16 @@ jobs:
             --start 2014-01-01 \
             --end 2026-09-23
 
-      - name: Run PCA CNN Transformer walk-forward backtest
+      - name: Save prepared NIFTY-100 dataset cache
+        if: always() && steps.dataset-cache.outputs.cache-hit != 'true' && hashFiles('data/processed/nifty100_adjusted_prices.parquet') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: data/processed/nifty100_adjusted_prices.parquet
+          key: nifty100-adjusted-v1-2014-01-01-2026-09-23
+
+      - name: Run full PCA CNN Transformer walk-forward backtest
         run: |
+          mkdir -p results/generated
           python scripts/run_pca_cnn_transformer.py \
             --eod data/processed/nifty100_adjusted_prices.parquet \
             --membership data/processed/index_membership_history.csv \
@@ -90,12 +111,16 @@ jobs:
             --start 2014-01-01 \
             --oos-start 2019-01-02 \
             --end 2026-09-23 \
-            --epochs 100
+            --epochs 100 \
+            --log results/generated/progress.jsonl \
+            2>&1 | tee results/generated/backtest.log
 
-      - name: Save results artifact
+      - name: Upload results and telemetry
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: nifty100-deep-stat-arb-results
-          path: results/generated/
-          retention-days: 30
+          name: nifty100-deep-stat-arb-results-${{ github.run_id }}
+          path: |
+            results/generated/
+            data/processed/nifty100_adjusted_prices.parquet
+          retention-days: 90
