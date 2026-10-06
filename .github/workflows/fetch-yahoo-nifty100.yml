@@ -1,0 +1,45 @@
+name: Fetch Yahoo NIFTY-100 Benchmark
+
+on:
+  push:
+    branches: ["data/yahoo-nifty100-benchmark"]
+  workflow_dispatch:
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch Yahoo ^CNX100
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check yfinance pandas
+          python - <<'PY'
+          import yfinance as yf, pandas as pd
+          from pathlib import Path
+          out=Path("benchmark"); out.mkdir()
+          x=yf.download("^CNX100", start="2019-01-02", end="2026-09-24",
+                        interval="1d", auto_adjust=False, progress=False)
+          if x.empty: raise RuntimeError("Yahoo returned no data")
+          if isinstance(x.columns,pd.MultiIndex): x.columns=x.columns.get_level_values(0)
+          x=x.reset_index()
+          x["Date"]=pd.to_datetime(x["Date"]).dt.strftime("%Y-%m-%d")
+          x=x[(x.Date>="2019-01-02")&(x.Date<="2026-09-23")][["Date","Close"]]
+          x=x.drop_duplicates("Date").sort_values("Date")
+          print("rows",len(x),"range",x.Date.min(),x.Date.max())
+          if len(x)<1800: raise RuntimeError("Too few benchmark observations")
+          if x.Date.min()!="2019-01-02" or x.Date.max()!="2026-09-23":
+              raise RuntimeError("Endpoint coverage failure")
+          x.rename(columns={"Close":"NIFTY100_Close"},inplace=True)
+          x.to_csv(out/"nifty100_yahoo_price.csv",index=False)
+          (out/"README.txt").write_text(
+            "Source: Yahoo Finance, symbol ^CNX100 (NIFTY 100).\n"
+            "Requested range: 2019-01-02 through 2026-09-23.\n")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: yahoo-nifty100-benchmark
+          path: benchmark/
+          retention-days: 90
