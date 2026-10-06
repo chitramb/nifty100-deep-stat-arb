@@ -42,7 +42,7 @@ jobs:
           mv /tmp/nse-snapshot/data /tmp/nse-db/data
 
       - name: Save NSE EOD snapshot cache
-        if: always() && steps.nse-cache.outputs.cache-hit != 'true' && hashFiles('/tmp/nse-db/data/**') != ''
+        if: always() && steps.nse-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: /tmp/nse-db/data
@@ -51,6 +51,8 @@ jobs:
       - name: Fetch NSEDATA4ME loader code
         run: |
           git clone --depth 1 --single-branch https://github.com/ancap97/NSEDATA4ME.git /tmp/nse-code
+          rm -rf /tmp/nse-code/data
+          ln -s /tmp/nse-db/data /tmp/nse-code/data
 
       - name: Build adjusted NIFTY-100 dataset
         run: |
