@@ -1,0 +1,98 @@
+name: Fetch NIFTY-100 Benchmark
+
+on:
+  push:
+    branches: ["data/nifty100-benchmark-2019-2026"]
+  workflow_dispatch:
+
+jobs:
+  fetch-benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Fetch NIFTY-100 price and TRI
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check requests pandas
+          python - <<'PY'
+          import json, requests, pandas as pd
+          from datetime import datetime
+          from pathlib import Path
+
+          OUT = Path("benchmark"); OUT.mkdir()
+          H = {
+            "Content-Type":"application/json; charset=UTF-8",
+            "X-Requested-With":"XMLHttpRequest",
+            "Referer":"https://www.niftyindices.com/reports/historical-data",
+            "User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36"
+          }
+
+          def fetch_price(start,end):
+            cinfo = {"name":"NIFTY 100","startDate":start,"endDate":end,"indexName":"NIFTY 100"}
+            r=requests.post("https://www.niftyindices.com/BackPage/getHistoricaldatatabletoString",
+              headers=H,json={"cinfo":str(cinfo).replace('"',"'")},timeout=90)
+            r.raise_for_status(); obj=r.json()
+            d=obj.get("d",obj)
+            if isinstance(d,str): d=json.loads(d)
+            return d
+
+          def fetch_tri(start,end):
+            s=f"{{'name':'NIFTY 100','startDate':'{start}','endDate':'{end}','indexName':'NIFTY 100'}}"
+            r=requests.post("https://www.niftyindices.com/BackPage/getTotalReturnIndexString",
+              headers=H,json={"cinfo":s},timeout=90)
+            r.raise_for_status(); obj=r.json()
+            d=obj.get("d",obj)
+            if isinstance(d,str): d=json.loads(d)
+            return d
+
+          chunks=[
+            ("02-Jan-2019","31-Dec-2019"),("01-Jan-2020","31-Dec-2020"),
+            ("01-Jan-2021","31-Dec-2021"),("01-Jan-2022","31-Dec-2022"),
+            ("01-Jan-2023","31-Dec-2023"),("01-Jan-2024","31-Dec-2024"),
+            ("01-Jan-2025","31-Dec-2025"),("01-Jan-2026","23-Sep-2026")]
+
+          price=[]; tri=[]
+          for a,b in chunks:
+            print("FETCH",a,b)
+            price += fetch_price(a,b)
+            tri += fetch_tri(a,b)
+
+          def date(x):
+            return datetime.strptime(x.strip(),"%d %b %Y").date().isoformat()
+
+          p=[]
+          for x in price:
+            d=x.get("HistoricalDate") or x.get("Date")
+            v=x.get("CLOSE") or x.get("Close")
+            if d and v not in (None,"-"): p.append((date(d),float(str(v).replace(",",""))))
+          t=[]
+          for x in tri:
+            d=x.get("HistoricalDate") or x.get("Date")
+            v=x.get("IndexValue") or x.get("TRI") or x.get("Index Value")
+            if d and v not in (None,"-"): t.append((date(d),float(str(v).replace(",",""))))
+
+          def dedup(rows):
+            return pd.DataFrame(rows,columns=["Date","Value"]).drop_duplicates("Date").sort_values("Date")
+
+          p=dedup(p).rename(columns={"Value":"NIFTY100_Close"})
+          t=dedup(t).rename(columns={"Value":"NIFTY100_TRI"})
+          p.to_csv(OUT/"nifty100_price.csv",index=False)
+          t.to_csv(OUT/"nifty100_tri.csv",index=False)
+
+          for name,df in [("price",p),("tri",t)]:
+            print(name, len(df), df.Date.min(), df.Date.max())
+            if len(df)<1800: raise RuntimeError(f"{name}: too few rows")
+            if df.Date.min()>"2019-01-02" or df.Date.max()<"2026-09-23":
+              raise RuntimeError(f"{name}: endpoint coverage failure")
+          (OUT/"README.txt").write_text(
+            "Source: NSE Indices historical-data API (niftyindices.com).\n"
+            "Range: 2019-01-02 through 2026-09-23.\n"
+            "NIFTY100_Close = price index close; NIFTY100_TRI = total-return index.\n")
+          PY
+      - name: Upload benchmark
+        uses: actions/upload-artifact@v4
+        with:
+          name: nifty100-benchmark-2019-2026
+          path: benchmark/
+          retention-days: 90
