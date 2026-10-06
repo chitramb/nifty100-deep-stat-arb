@@ -3,7 +3,19 @@ name: Run NIFTY-100 research
 on:
   push:
     branches: [main]
+    paths:
+      - 'scripts/**'
+      - 'configs/**'
+      - '.github/workflows/run-research.yml'
+      - 'pyproject.toml'
   workflow_dispatch:
+
+# Only one research run should consume a hosted runner at a time. A new commit
+# supersedes an older experiment; this prevents accidental parallel runs while
+# the research code is being iterated.
+concurrency:
+  group: nifty100-research
+  cancel-in-progress: true
 
 jobs:
   backtest:
