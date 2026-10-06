@@ -1,0 +1,113 @@
+name: Fetch NIFTY-100 Benchmark
+
+on:
+  push:
+    branches: ["data/nifty100-benchmark-2019-2026"]
+  workflow_dispatch:
+
+jobs:
+  fetch-benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Fetch price and TRI series
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, re, requests
+          from datetime import datetime
+          from pathlib import Path
+
+          START = "02-Jan-2019"
+          END = "23-Sep-2026"
+          OUT = Path("benchmark")
+          OUT.mkdir()
+
+          url_price = "https://www.niftyindices.com/Backpage.aspx/getHistoricaldatatabletoString"
+          url_tri = "https://www.niftyindices.com/Backpage.aspx/getTotalReturnIndexString"
+          headers = {
+              "Content-Type": "application/json; charset=UTF-8",
+              "X-Requested-With": "XMLHttpRequest",
+              "Referer": "https://www.niftyindices.com/reports/historical-data",
+              "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36",
+          }
+
+          def post(url, payload):
+              r = requests.post(url, headers=headers, json=payload, timeout=120)
+              r.raise_for_status()
+              obj = r.json()
+              raw = obj.get("d", "")
+              if isinstance(raw, str):
+                  try:
+                      return json.loads(raw)
+                  except json.JSONDecodeError:
+                      # Some deployments return a JSON-looking escaped string.
+                      return json.loads(raw.replace('\\\"','\"'))
+              return raw
+
+          price_payload = {"cinfo": {"name":"NIFTY 100","startDate":START,"endDate":END,"indexName":"NIFTY 100"}}
+          tri_payload = {"cinfo": "{'name':'NIFTY 100','startDate':'02-Jan-2019','endDate':'23-Sep-2026','indexName':'NIFTY 100'}"}
+
+          price = post(url_price, price_payload)
+          tri = post(url_tri, tri_payload)
+
+          print("price records:", len(price))
+          print("tri records:", len(tri))
+          if len(price) < 1800:
+              raise SystemExit(f"Too few price records: {len(price)}")
+          if len(tri) < 1800:
+              raise SystemExit(f"Too few TRI records: {len(tri)}")
+
+          (OUT/"price_raw.json").write_text(json.dumps(price, indent=2), encoding="utf-8")
+          (OUT/"tri_raw.json").write_text(json.dumps(tri, indent=2), encoding="utf-8")
+
+          import csv
+          def norm_date(x):
+              for fmt in ("%d %b %Y", "%d-%b-%Y", "%d/%m/%Y"):
+                  try:
+                      return datetime.strptime(x.strip(), fmt).strftime("%Y-%m-%d")
+                  except ValueError:
+                      pass
+              raise ValueError(f"Unrecognized date: {x!r}")
+
+          def write_csv(rows, path, value_key, out_key):
+              # Preserve the source fields but normalize to Date and value.
+              out=[]
+              for row in rows:
+                  d = row.get("HistoricalDate") or row.get("Date") or row.get("IndexDate")
+                  v = row.get(value_key)
+                  if d is None or v is None:
+                      continue
+                  out.append({"Date": norm_date(d), out_key: float(str(v).replace(",",""))})
+              out.sort(key=lambda z:z["Date"])
+              # Deduplicate exact dates, keeping the last source row.
+              dedup={r["Date"]:r for r in out}
+              out=[dedup[d] for d in sorted(dedup)]
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  w=csv.DictWriter(f, fieldnames=["Date",out_key])
+                  w.writeheader(); w.writerows(out)
+              return out
+
+          p = write_csv(price, OUT/"nifty100_price.csv", "CLOSE", "NIFTY100_Close")
+          t = write_csv(tri, OUT/"nifty100_tri.csv", "IndexValue", "NIFTY100_TRI")
+
+          for label, rows in [("price",p),("tri",t)]:
+              if rows[0]["Date"] > "2019-01-02" or rows[-1]["Date"] < "2026-09-23":
+                  raise SystemExit(f"{label} does not cover requested endpoints: {rows[0]['Date']}..{rows[-1]['Date']}")
+              print(label, rows[0]["Date"], rows[-1]["Date"], len(rows))
+
+          Path("benchmark/README.txt").write_text(
+              "Source: NSE Indices / niftyindices.com historical-data APIs.\n"
+              "Requested range: 2019-01-02 through 2026-09-23.\n"
+              "Price index: NIFTY 100 close.\n"
+              "TRI: NIFTY 100 Total Return Index.\n"
+              "Fetched by GitHub Actions with browser-like headers.\n",
+              encoding="utf-8")
+          PY
+      - name: Upload benchmark
+        uses: actions/upload-artifact@v4
+        with:
+          name: nifty100-benchmark-2019-2026
+          path: benchmark/
+          retention-days: 90
