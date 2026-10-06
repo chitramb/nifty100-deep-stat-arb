@@ -5,14 +5,12 @@ on:
     branches: [main]
     paths:
       - 'scripts/**'
+      - 'tests/**'
       - 'configs/**'
       - '.github/workflows/run-research.yml'
       - 'pyproject.toml'
   workflow_dispatch:
 
-# Only one research run should consume a hosted runner at a time. A new commit
-# supersedes an older experiment; this prevents accidental parallel runs while
-# the research code is being iterated.
 concurrency:
   group: nifty100-research
   cancel-in-progress: true
@@ -32,7 +30,12 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install numpy pandas scipy scikit-learn pyarrow torch pyyaml requests beautifulsoup4 tqdm
+          pip install numpy pandas scipy scikit-learn pyarrow torch pyyaml requests beautifulsoup4 tqdm pytest
+
+      - name: Run unit and leakage tests
+        run: |
+          python -m compileall -q scripts
+          pytest -q tests/test_strategy_math.py tests/test_data.py
 
       - name: Fetch point-in-time membership
         run: |
