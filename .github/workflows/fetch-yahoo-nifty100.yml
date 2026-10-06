@@ -1,8 +1,8 @@
 name: Fetch Yahoo NIFTY-100 Benchmark
 
 on:
-  push:
-    branches: ["data/yahoo-nifty100-benchmark"]
+  pull_request:
+    branches: ["main"]
   workflow_dispatch:
 
 jobs:
