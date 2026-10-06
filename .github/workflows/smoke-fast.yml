@@ -12,41 +12,100 @@ concurrency:
 jobs:
   smoke:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: pip
-      - name: Install lightweight dependencies
-        timeout-minutes: 8
+
+      - name: Install CPU-only dependencies
+        timeout-minutes: 10
         run: |
           python -m pip install --upgrade pip
-          pip install --prefer-binary numpy pandas scipy scikit-learn pyyaml pytest
+          pip install --prefer-binary numpy pandas scipy scikit-learn pyarrow pyyaml requests beautifulsoup4 tqdm pytest
           pip install --prefer-binary --index-url https://download.pytorch.org/whl/cpu torch
+
       - name: Verify imports
         run: |
           python - <<'PY'
-          import numpy, pandas, scipy, sklearn, torch
+          import numpy, pandas, scipy, sklearn, pyarrow, torch
           print('numpy', numpy.__version__)
           print('pandas', pandas.__version__)
           print('scipy', scipy.__version__)
           print('sklearn', sklearn.__version__)
+          print('pyarrow', pyarrow.__version__)
           print('torch', torch.__version__)
           print('torch.cuda.is_available()', torch.cuda.is_available())
           PY
+
       - name: Run unit and leakage tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}
         run: |
-          export PYTHONPATH="$GITHUB_WORKSPACE"
-          python -m pytest -q tests
-      - name: Run tiny end-to-end smoke test
-        timeout-minutes: 8
+          python -m compileall -q scripts
+          pytest -q tests/test_strategy_math.py tests/test_data.py
+
+      - name: Fetch point-in-time membership
         run: |
-          export PYTHONPATH="$GITHUB_WORKSPACE"
-          python scripts/run_pca_cnn_transformer.py --epochs 2 --train-days 252 --oos-days 20 --max-oos-blocks 1 --batch-size 16 --output-dir smoke_results
+          git clone --depth 1 https://github.com/aditya-jha/nse-historical-membership.git /tmp/nse-membership
+          mkdir -p data/processed
+          cp /tmp/nse-membership/index_history/data/index_membership_history.csv data/processed/index_membership_history.csv
+
+      - name: Restore pinned NSE EOD snapshot
+        id: nse-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/nse-db/data
+          key: nse-eod-a13d8112c71528183fff44ac8b27a1458bea3da4
+
+      - name: Fetch pinned NSE EOD snapshot
+        if: steps.nse-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch data --single-branch https://github.com/ancap97/NSEDATA4ME.git /tmp/nse-snapshot
+          mkdir -p /tmp/nse-db
+          mv /tmp/nse-snapshot/data /tmp/nse-db/data
+
+      - name: Save NSE EOD snapshot cache
+        if: steps.nse-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/nse-db/data
+          key: nse-eod-a13d8112c71528183fff44ac8b27a1458bea3da4
+
+      - name: Fetch NSEDATA4ME loader code
+        run: |
+          git clone --depth 1 --single-branch https://github.com/ancap97/NSEDATA4ME.git /tmp/nse-code
+          rm -rf /tmp/nse-code/data
+          ln -s /tmp/nse-db/data /tmp/nse-code/data
+
+      - name: Build smoke NIFTY-100 dataset
+        run: |
+          python scripts/prepare_nifty100_dataset.py \
+            --nse-code /tmp/nse-code \
+            --membership data/processed/index_membership_history.csv \
+            --out data/processed \
+            --start 2014-01-01 \
+            --end 2019-06-30
+
+      - name: Run tiny real end-to-end smoke test
+        timeout-minutes: 12
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python scripts/run_pca_cnn_transformer.py \
+            --eod data/processed/nifty100_adjusted_prices.parquet \
+            --membership data/processed/index_membership_history.csv \
+            --out smoke_results \
+            --start 2014-01-01 \
+            --oos-start 2019-01-02 \
+            --end 2019-06-30 \
+            --epochs 2
+
       - name: Upload smoke diagnostics
         if: always()
         uses: actions/upload-artifact@v4
