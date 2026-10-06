@@ -1,0 +1,44 @@
+universe:
+  name: NIFTY100
+  start: "2009-06-26"
+  end: null
+
+data:
+  price_field: close
+  return_type: log
+  corporate_action_adjustment: true
+
+factor_model:
+  type: PCA
+  n_factors: 5
+  lookback_days: 1000
+  refit_every_days: 125
+
+signal:
+  lookback_days: 30
+  representation: cumulative_residual
+
+model:
+  cnn:
+    layers: 2
+    filters: 8
+    kernel_size: 2
+  transformer:
+    heads: 4
+
+portfolio:
+  normalization: l1
+  dollar_neutral: true
+  max_gross_leverage: 1.0
+  max_position: null
+
+training:
+  objective: sharpe
+  transaction_cost_bps: 0.0
+  epochs: 50
+  learning_rate: 0.001
+
+backtest:
+  rebalance: daily
+  estimation_window_days: 1000
+  out_of_sample_block_days: 125
